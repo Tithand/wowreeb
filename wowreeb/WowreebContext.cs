@@ -25,6 +25,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -37,11 +38,73 @@ namespace wowreeb
 {
     class WowreebContext : ApplicationContext
     {
-        [DllImport("wowreeb.dll", CharSet = CharSet.Unicode)]
-        private static extern uint Inject([MarshalAs(UnmanagedType.LPWStr)] string exe,
+        #region Injection
+        [DllImport("wowreeb.dll", CharSet = CharSet.Unicode, EntryPoint = "Inject")]
+        private static extern uint Inject32([MarshalAs(UnmanagedType.LPWStr)] string exe,
             [MarshalAs(UnmanagedType.LPWStr)] string dll, [MarshalAs(UnmanagedType.LPStr)] string authServer, float fov,
             [MarshalAs(UnmanagedType.LPWStr)] string clrDll, [MarshalAs(UnmanagedType.LPWStr)] string clrTypeName,
             [MarshalAs(UnmanagedType.LPWStr)] string clrMethodName);
+
+        [DllImport("wowreeb64.dll", CharSet = CharSet.Unicode, EntryPoint = "Inject")]
+        private static extern uint Inject64([MarshalAs(UnmanagedType.LPWStr)] string exe,
+            [MarshalAs(UnmanagedType.LPWStr)] string dll, [MarshalAs(UnmanagedType.LPStr)] string authServer, float fov,
+            [MarshalAs(UnmanagedType.LPWStr)] string clrDll, [MarshalAs(UnmanagedType.LPWStr)] string clrTypeName,
+            [MarshalAs(UnmanagedType.LPWStr)] string clrMethodName);
+
+        private static uint Inject(string exe, string dll, string authServer, float fov, string clrDll,
+            string clrTypeName, string clrMethodName)
+        {
+            return Environment.Is64BitProcess
+                ? Inject64(exe, dll, authServer, fov, clrDll, clrTypeName, clrMethodName)
+                : Inject32(exe, dll, authServer, fov, clrDll, clrTypeName, clrMethodName);
+        }
+        #endregion
+
+        #region Binary type detection
+        [SuppressMessage("ReSharper", "InconsistentNaming")]
+        private enum BinaryType : uint
+        {
+            SCS_32BIT_BINARY = 0,
+            SCS_64BIT_BINARY = 6,
+            SCS_DOS_BINARY = 1,
+            SCS_OS216_BINARY = 5,
+            SCS_PIF_BINARY = 3,
+            SCS_POSIX_BINARY = 4,
+            SCS_WOW_BINARY = 2
+        }
+
+        // taken from https://stackoverflow.com/questions/44337501/get-type-of-binary-on-filesystem-via-c-sharp-running-in-64-bit
+        private static BinaryType? GetBinaryType(string path)
+        {
+            using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read))
+            {
+                stream.Seek(0x3C, SeekOrigin.Begin);
+                using (var reader = new BinaryReader(stream))
+                {
+                    if (stream.Position + sizeof(int) > stream.Length)
+                        return null;
+                    var peOffset = reader.ReadInt32();
+                    stream.Seek(peOffset, SeekOrigin.Begin);
+                    if (stream.Position + sizeof(uint) > stream.Length)
+                        return null;
+                    var peHead = reader.ReadUInt32();
+                    if (peHead != 0x00004550) // "PE\0\0"
+                        return null;
+                    if (stream.Position + sizeof(ushort) > stream.Length)
+                        return null;
+                    switch (reader.ReadUInt16())
+                    {
+                        case 0x14c:
+                            return BinaryType.SCS_32BIT_BINARY;
+                        case 0x8664:
+                            return BinaryType.SCS_64BIT_BINARY;
+                        default:
+                            return null;
+                    }
+                }
+            }
+        }
+        #endregion
 
         private struct VersionEntry
         {
@@ -79,7 +142,7 @@ namespace wowreeb
             };
         }
 
-        private bool CheckExecutableIntegrity(string path, string expected)
+        private static bool CheckExecutableIntegrity(string path, string expected)
         {
             using (var sha256 = SHA256.Create())
             {
@@ -107,10 +170,23 @@ namespace wowreeb
                 return;
             }
 
-            // TODO: Add x64 support
-            Inject(_versionEntries[entry].Path, Directory.GetCurrentDirectory() + "\\wowreeb.dll",
-                _versionEntries[entry].AuthServer, _versionEntries[entry].Fov, _versionEntries[entry].CLRDll,
-                _versionEntries[entry].CLRTypeName, _versionEntries[entry].CLRMethodName);
+            var binType = GetBinaryType(path);
+
+            if (binType == BinaryType.SCS_64BIT_BINARY)
+            {
+                Inject(path, Directory.GetCurrentDirectory() + "\\wowreeb64.dll", _versionEntries[entry].AuthServer,
+                    _versionEntries[entry].Fov, _versionEntries[entry].CLRDll, _versionEntries[entry].CLRTypeName,
+                    _versionEntries[entry].CLRMethodName);
+            }
+            // target executable is 32 bit
+            else if (binType == BinaryType.SCS_32BIT_BINARY)
+            {
+                Inject(path, Directory.GetCurrentDirectory() + "\\wowreeb.dll", _versionEntries[entry].AuthServer,
+                    _versionEntries[entry].Fov, _versionEntries[entry].CLRDll, _versionEntries[entry].CLRTypeName,
+                    _versionEntries[entry].CLRMethodName);
+            }
+            else
+                MessageBox.Show($"Unknown binary type {binType} for {path}");
         }
 
         private void Exit(object sender, EventArgs e)
